@@ -76,8 +76,20 @@ function Test-FutPort {
 }
 
 function Test-ServerProcess {
-    $running = Get-Process -Name python, pythonw, py -ErrorAction SilentlyContinue
-    return [bool] $running
+    # Match on the command line, not just the image name: an unrelated Python
+    # process must not stand in for server.py and mask its death (exit 2).
+    try {
+        $running = Get-CimInstance Win32_Process -ErrorAction Stop |
+            Where-Object {
+                ($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and
+                $_.CommandLine -like '*localfut15*server.py*'
+            }
+        return [bool] $running
+    } catch {
+        # If the CIM query is unavailable, fall back to the image-name check
+        # rather than reporting the server as gone.
+        return [bool] (Get-Process -Name python, pythonw, py -ErrorAction SilentlyContinue)
+    }
 }
 
 function Find-ForeignPortsFile {
