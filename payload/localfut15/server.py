@@ -5486,32 +5486,26 @@ def route_fut(method: str, raw_path: str, headers: dict[str, str], body: bytes) 
         )
         rid = int(requested_def or 0)
         iid = _query_int(query, ("itemId", "itemid", "itemIdList", "itemidlist"), 0)
-        if iid:
-            item = STATE.get_item(iid)
-            if item:
-                rid = int(item.get("resourceId", item.get("assetId", rid)) or rid)
+        item = STATE.get_item(iid) if iid else None
+        if item:
+            # An item id is the strongest identity available.  Several FIFA
+            # definitions can share one base assetId, so never replace this
+            # exact owned version with another card owned by the user.
+            rid = int(item.get("resourceId", item.get("assetId", rid)) or rid)
+        elif rid:
+            # Pack-result cards use a response-only sortable resourceId alias.
+            # Resolve only aliases from the current unassigned carousel; do not
+            # guess by scanning every owned card with the same base assetId.
+            # That old guess made a base CR7/Neymar/Tevez card inherit the range
+            # of an owned TOTY/IF version.
+            rid = int(_current_pack_display_alias_map().get(rid, rid))
 
-        # Pack-result cards are displayed with a sortable alias whose high byte
-        # encodes carousel order (e.g. 0x01xxxxxx), while the owned special item
-        # retains the real special resource id (e.g. 0x04xxxxxx).  Resolve the
-        # owned definition for pricing, but mask the definition for the response.
-        if rid:
-            base_asset = int(rid) & 0x00FFFFFF
-            candidates = []
-            for owned in STATE.list_items():
-                if str(owned.get("itemType", "player")) != "player":
-                    continue
-                try:
-                    owned_asset = int(owned.get("assetId", 0) or 0) & 0x00FFFFFF
-                    owned_rid = int(owned.get("resourceId", 0) or 0)
-                    owned_id = int(owned.get("id", 0) or 0)
-                except Exception:
-                    continue
-                if owned_asset == base_asset and owned_rid in PLAYER_DB:
-                    candidates.append((owned_id, owned_rid))
-            if candidates:
-                candidates.sort(reverse=True)
-                rid = int(candidates[0][1])
+        # If a stale/unknown alias reaches this endpoint, fall back to the base
+        # player definition when it is known.  This is deterministic and keeps
+        # the price editor usable without confusing one special version for
+        # another.
+        if rid not in PLAYER_DB and (int(rid) & 0x00FFFFFF) in PLAYER_DB:
+            rid = int(rid) & 0x00FFFFFF
 
         guide = STATE.market_reference_price(rid) if rid in PLAYER_DB else 1000
 
