@@ -48,6 +48,25 @@ Run **`ADD_COINS.cmd`** and enter how many local coins you want to add. The defa
 
 This is a **test release**, so logs are intentionally verbose. They are stored under `%LOCALAPPDATA%\FIFA15LocalFUT\logs` and are useful when reporting bugs.
 
+## If FIFA does not launch
+
+The launcher waits for the localhost FUT service before starting FIFA 15 and,
+if it gives up, now prints the specific reason instead of a generic timeout:
+
+- **Still installing Python dependencies** — run `INSTALL_PREREQUISITES.cmd`
+  once, let it finish, then launch again.
+- **Server process exited during startup** — the Local FUT Server window names
+  the failing service and port. Read it before closing it.
+- **Different Windows profile** — launch with "Run as administrator" from an
+  account that is itself an administrator, rather than typing another account's
+  credentials at the UAC prompt.
+- **Port refuses connections** — a security suite is intercepting loopback. Run
+  `PORT_DIAGNOSTICS.cmd` and `LOCAL_FUT_STATUS.cmd`.
+
+A cold first start has to seed the local card database and can take a while on
+slow disks. The default wait is 180 seconds; raise it if needed by running
+`set LOCALFUT_WAIT_SECONDS=300` in the same window before the launcher.
+
 ## Files new testers should care about
 
 - `INSTALL_PREREQUISITES.cmd` — one-time dependency setup.
