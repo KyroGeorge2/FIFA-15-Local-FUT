@@ -52,6 +52,15 @@ LOGS = RUNTIME_ROOT / "logs"
 LEGACY_DB_PATH = DATA / "localfut15.sqlite3"
 DB_PATH = RUNTIME_ROOT / "fut15-local.sqlite3"
 CONFIG_PATH = ROOT / "config.json"
+# A second copy of the port map lives in a machine-wide folder. PLAY_LOCAL_FUT15
+# always runs elevated, so when UAC elevates into a different administrator
+# account the launcher no longer shares LOCALAPPDATA with this process and would
+# never find the per-profile copy.
+_program_data = os.environ.get("ProgramData")
+if _program_data:
+    SHARED_PORTS_PATH = Path(_program_data) / "FIFA15LocalFUT" / "runtime_ports.json"
+else:
+    SHARED_PORTS_PATH = None
 
 DATA.mkdir(parents=True, exist_ok=True)
 LOGS.mkdir(parents=True, exist_ok=True)
@@ -7764,6 +7773,26 @@ def _prepare_lsx(host: str) -> tuple[Any | None, str]:
         return None, "unavailable"
 
 
+def _write_shared_ports(ports: dict[str, Any]) -> None:
+    """Best-effort machine-wide copy of the port map for an elevated launcher."""
+    if SHARED_PORTS_PATH is None:
+        return
+    try:
+        SHARED_PORTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SHARED_PORTS_PATH.write_text(json.dumps(ports, indent=2), encoding="utf-8")
+    except Exception as exc:
+        log.debug("Could not write shared port map %s: %s", SHARED_PORTS_PATH, exc)
+
+
+def _clear_shared_ports() -> None:
+    if SHARED_PORTS_PATH is None:
+        return
+    try:
+        SHARED_PORTS_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _write_runtime_routing(host: str, *, lsx_mode: str = "local") -> None:
     """Write the chosen ports before FIFA starts so the local hook follows fallbacks."""
     game_root = ROOT.parent
@@ -7843,6 +7872,7 @@ Redirect.5.Secure=0
         "legacy_fut_port": legacy,
     }
     (RUNTIME_ROOT / "runtime_ports.json").write_text(json.dumps(ports, indent=2), encoding="utf-8")
+    _write_shared_ports(ports)
     log.info("Runtime port map: %s", ports)
 
 
@@ -7857,6 +7887,7 @@ def main() -> int:
         runtime_ports.unlink(missing_ok=True)
     except Exception:
         pass
+    _clear_shared_ports()
 
     servers: list[Any] = []
     try:
@@ -7938,6 +7969,7 @@ def main() -> int:
             runtime_ports.unlink(missing_ok=True)
         except Exception:
             pass
+        _clear_shared_ports()
         for s in servers:
             try:
                 s.shutdown()
