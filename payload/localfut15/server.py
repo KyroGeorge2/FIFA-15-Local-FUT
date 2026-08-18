@@ -4159,7 +4159,7 @@ def _season_trophy_big_response(request_path: str) -> bytes:
     `item.big` request and the full trophy payload when its explicit name is asked.
     """
     low_path = str(request_path or "").lower()
-    candidate = SEASON_TROPHY_ITEM_BIG if low_path.endswith("/item.big") else SEASON_TROPHY_FULL_BIG
+    candidate = SEASON_TROPHY_FULL_BIG
     try:
         blob = candidate.read_bytes()
         if blob:
