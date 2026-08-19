@@ -42,8 +42,15 @@ ROOT = Path(__file__).resolve().parent
 _local_app_data = os.environ.get("LOCALAPPDATA")
 if _local_app_data:
     RUNTIME_ROOT = Path(_local_app_data) / "FIFA15LocalFUT"
-else:
+elif os.name == "nt":
     RUNTIME_ROOT = Path.home() / "AppData" / "Local" / "FIFA15LocalFUT"
+else:
+    # Linux/Unix: follow the XDG base directory spec so runtime state lands in
+    # ~/.local/share/FIFA15LocalFUT instead of a bogus ~/AppData/Local path.
+    RUNTIME_ROOT = (
+        Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+        / "FIFA15LocalFUT"
+    )
 DATA = RUNTIME_ROOT / "data"
 LOGS = RUNTIME_ROOT / "logs"
 # v0.2.29 promotes the SQLite save to the LocalAppData profile root so every
