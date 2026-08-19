@@ -52,7 +52,7 @@ start_server() {
   die "Server did not become ready in time. See $STATE_DIR/logs/server-console.log"
 }
 
-if pgrep -f "localfut15/server.py" >/dev/null 2>&1; then
+if pgrep -f "server.py --host 127.0.0.1" >/dev/null 2>&1; then
   say "Server already running."
 else
   start_server
