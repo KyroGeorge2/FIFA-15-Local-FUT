@@ -501,6 +501,104 @@ CLUB_COSMETIC_CATALOG = _club_cosmetic_catalog()
 CLUB_COSMETIC_BY_RESOURCE = {int(x["resourceId"]): x for x in CLUB_COSMETIC_CATALOG}
 
 
+# FIFA 15 validates squad names in the client with a 15-character limit. Keep
+# the same bound on the persisted value so a rename made through a slightly
+# different HTTP path cannot leave an unrenderable squad in the club.
+SQUAD_NAME_MAX_LENGTH = 15
+
+
+def _squad_request_document(payload: Any) -> dict[str, Any]:
+    """Flatten squad envelopes used by the PC client and web app."""
+    if isinstance(payload, list):
+        payload = next((x for x in payload if isinstance(x, dict)), {})
+    if not isinstance(payload, dict):
+        return {}
+
+    outer = dict(payload)
+    for wrapper in ("squad", "squadData", "squadInfo"):
+        nested = outer.get(wrapper)
+        if not isinstance(nested, dict):
+            continue
+        document = dict(nested)
+        # Keep useful request-level fields when the client puts the id/action
+        # beside the nested squad object rather than inside it.
+        for key, value in outer.items():
+            if key != wrapper and key not in document:
+                document[key] = value
+        return document
+    return outer
+
+
+def _squad_name(value: Any, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = str(fallback or "Squad").strip() or "Squad"
+    return text[:SQUAD_NAME_MAX_LENGTH]
+
+
+def _squad_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"1", "true", "yes", "on", "active"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "inactive"}:
+            return False
+    return bool(default)
+
+
+def _squad_request_value(document: dict[str, Any], query: dict[str, list[str]], *keys: str) -> Any:
+    for key in keys:
+        if key in document and document.get(key) not in (None, ""):
+            return document.get(key)
+        values = query.get(key)
+        if values and values[0] not in (None, ""):
+            return values[0]
+    return None
+
+
+def _squad_request_id(document: dict[str, Any], query: dict[str, list[str]], *keys: str) -> int | None:
+    raw = _squad_request_value(document, query, *keys)
+    try:
+        value = int(raw or 0)
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
+_SQUAD_COPY_NAME_RE = re.compile(
+    r"^(?:copy|copie|copia|kopie|kopija|còpia)\d*\s+",
+    re.IGNORECASE,
+)
+
+
+def _squad_copy_name(value: Any) -> bool:
+    """Return whether a squad name is the native UI's duplicate name."""
+    return _SQUAD_COPY_NAME_RE.match(str(value or "").strip()) is not None
+
+
+def _squad_player_reference_count(document: dict[str, Any]) -> int:
+    players = document.get("players", [])
+    if not isinstance(players, list):
+        return 0
+    count = 0
+    for entry in players:
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("itemId")
+        if raw is None and isinstance(entry.get("itemData"), dict):
+            raw = entry["itemData"].get("id")
+        try:
+            if int(raw or 0) > 0:
+                count += 1
+        except Exception:
+            continue
+    return count
+
+
 class State:
     def __init__(self, path: Path):
         self.path = path
@@ -1900,10 +1998,10 @@ class State:
         updates. Older builds replaced the whole stored JSON on every PUT, so one
         partial write could wipe the lineup and it disappeared after relaunch.
         """
-        src = dict(payload) if isinstance(payload, dict) else {}
-        if isinstance(src.get("squad"), dict):
-            src = dict(src["squad"])
+        src = _squad_request_document(payload)
         sid = int(src.get("id") or src.get("squadId") or 1)
+        if sid <= 0:
+            sid = 1
 
         with self.lock:
             row = self.conn.execute("SELECT name,active,data FROM squads WHERE id=?", (sid,)).fetchone()
@@ -1989,12 +2087,19 @@ class State:
                 merged["players"] = [slot_map[i] for i in sorted(slot_map)]
 
             # Explicit rename/create fields win over the previously persisted aliases.
-            name = str(src.get("squadName") or src.get("name") or merged.get("squadName") or merged.get("name") or f"Squad {sid}")
+            name = _squad_name(
+                src.get("squadName") or src.get("name") or src.get("newSquadName") or src.get("newName"),
+                str(merged.get("squadName") or merged.get("name") or f"Squad {sid}"),
+            )
             merged["id"] = sid
             merged["squadId"] = sid
             merged["name"] = name
             merged["squadName"] = name
-            active = 1 if bool(merged.get("active", row["active"] if row else sid == 1)) else 0
+            # JSON from older saves may still say active=true after another
+            # squad was selected. Only an explicit request field or the SQL
+            # canonical flag may decide whether this write activates the squad.
+            requested_active = src["active"] if "active" in src else (row["active"] if row else sid == 1)
+            active = 1 if _squad_bool(requested_active, bool(row["active"] if row else sid == 1)) else 0
             merged["active"] = bool(active)
 
             if active:
@@ -2017,16 +2122,24 @@ class State:
             return max(1, int(row[0] if row else 0) + 1)
 
     def create_squad(self, payload: Any) -> dict[str, Any]:
-        src = dict(payload) if isinstance(payload, dict) else {}
-        sid = self.next_squad_id()
-        src["id"] = sid
-        src["squadId"] = sid
-        src["active"] = True
-        src.setdefault("squadName", src.get("name") or f"Squad {sid}")
-        src.setdefault("name", src.get("squadName") or f"Squad {sid}")
-        src.setdefault("formation", "f442")
-        src.setdefault("players", [])
-        saved = self.save_squad(src)
+        src = _squad_request_document(payload)
+        # Allocate and persist under the same lock. The HTTP server is threaded;
+        # keeping these operations atomic prevents two fast create requests from
+        # receiving the same next squad id.
+        with self.lock:
+            row = self.conn.execute("SELECT COALESCE(MAX(id),0) FROM squads").fetchone()
+            sid = max(1, int(row[0] if row else 0) + 1)
+            src["id"] = sid
+            src["squadId"] = sid
+            src["active"] = True
+            src["squadName"] = _squad_name(
+                src.get("squadName") or src.get("name") or src.get("newSquadName") or src.get("newName"),
+                f"Squad {sid}",
+            )
+            src["name"] = src["squadName"]
+            src.setdefault("formation", "f442")
+            src.setdefault("players", [])
+            saved = self.save_squad(src)
         log.warning("SQUAD CREATE sid=%s name=%s players=%s", sid, saved.get("squadName"), len(saved.get("players", [])))
         return saved
 
@@ -2043,9 +2156,19 @@ class State:
         src.pop("id", None)
         src.pop("squadId", None)
         if name:
-            src["name"] = str(name)[:32]
-            src["squadName"] = str(name)[:32]
+            cloned_name = _squad_name(name, str(src.get("squadName") or src.get("name") or "Squad"))
+            src["name"] = cloned_name
+            src["squadName"] = cloned_name
         return self.create_squad(src)
+
+    def activate_squad(self, sid: int) -> dict[str, Any] | None:
+        """Make an existing squad active without changing its lineup."""
+        sid = int(sid)
+        with self.lock:
+            row = self.conn.execute("SELECT 1 FROM squads WHERE id=?", (sid,)).fetchone()
+        if not row:
+            return None
+        return self.save_squad({"id": sid, "squadId": sid, "active": True})
 
     def delete_squad(self, sid: int) -> bool:
         sid = int(sid)
@@ -3255,6 +3378,7 @@ def _native_squad(requested_id: int | None = None) -> dict[str, Any]:
     populated = [x for x in players if isinstance(x.get("itemData"), dict)]
     sid = int(src.get("id") or src.get("squadId") or 1)
     name = str(src.get("squadName") or src.get("name") or "Local XI")
+    rating, chemistry = _squad_summary_values(src, item_by_id)
     captain = int(src.get("captain") or (populated[0]["itemData"]["id"] if populated else 0))
     kick_ids = [int(x["itemData"]["id"]) for x in populated[:5]]
     while kick_ids and len(kick_ids) < 5:
@@ -3264,13 +3388,15 @@ def _native_squad(requested_id: int | None = None) -> dict[str, Any]:
     actives = _active_club_items()
     return {
         "id": sid,
+        "squadId": sid,
         "personaId": int(CFG["persona_id"]),
         "squadName": name,
         "formation": str(src.get("formation") or "f442"),
         "captain": captain,
-        "chemistry": int(src.get("chemistry", 100) if src.get("chemistry") is not None else 100),
+        "chemistry": chemistry,
         "changed": 0,
-        "starRating": int(src.get("starRating", 5) or 5),
+        "starRating": rating,
+        "rating": rating,
         "custom": str(src.get("custom") or "[0,0,0,0,0,0,0,0,0,0,0]"),
         "players": players,
         "actives": actives,
@@ -3280,28 +3406,271 @@ def _native_squad(requested_id: int | None = None) -> dict[str, Any]:
     }
 
 
-def _compact_squad_record(src: dict[str, Any]) -> dict[str, Any]:
+_FUT15_POSITION_COMPATIBILITY: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "GK": ((), ()),
+    "RWB": (("RB",), ("LWB", "RM", "RW")),
+    "RB": (("RWB",), ("CB", "LB", "RM")),
+    "CB": ((), ("RB", "LB", "CDM")),
+    "LB": (("LWB",), ("RB", "CB", "LM")),
+    "LWB": (("LB",), ("RWB", "LM", "LW")),
+    "CDM": (("CM",), ("CB", "CAM")),
+    "RM": (("RW",), ("RWB", "RB", "CM", "LM", "RF")),
+    "CM": (("CDM", "CAM"), ("RM", "LM")),
+    "LM": (("LW",), ("LB", "LWB", "RM", "CM", "LF")),
+    "CAM": (("CM", "CF"), ("CDM",)),
+    "RF": (("RW",), ("RM", "CF", "LF", "ST")),
+    "CF": (("CAM", "ST"), ("RF", "LF")),
+    "LF": (("LW",), ("LM", "RF", "CF", "ST")),
+    "RW": (("RM", "RF"), ("RWB", "LW")),
+    "ST": (("CF",), ("RF", "LF")),
+    "LW": (("LM", "LF"), ("LWB", "RW")),
+}
+
+# Slot order and chemistry links extracted from FIFA 15's own
+# formations/fcc_chemlinkcalc tables in cards_ng_db.db.
+_FUT15_FORMATIONS: dict[str, tuple[tuple[str, ...], tuple[tuple[int, ...], ...]]] = {
+    "f3412": (("GK","RCB","CB","LCB","RM","RCM","LCM","LM","CAM","RS","LS"), ((1,2,3),(0,2,4),(0,1,3,5,6),(0,2,7),(1,5,9),(2,4,6,8),(2,5,7,8),(3,6,10),(5,6,9,10),(4,8,10),(7,8,9))),
+    "f3421": (("GK","RCB","CB","LCB","RM","RCM","LCM","LM","RF","LF","ST"), ((1,2,3),(0,2,4),(0,1,3,5,6),(0,2,7),(1,5,8),(2,4,6,8),(2,5,7,9),(3,6,9),(4,5,10),(6,7,10),(8,9))),
+    "f343": (("GK","RCB","CB","LCB","RM","RCM","LCM","LM","RW","ST","LW"), ((1,2,3),(0,2,4),(0,1,3,5,6),(0,2,7),(1,5,8),(2,4,6,9),(2,5,7,9),(3,6,10),(4,9),(5,6,8,10),(7,9))),
+    "f352": (("GK","RCB","CB","LCB","RDM","LDM","RM","LM","CAM","RS","LS"), ((1,2,3),(0,2,4,6),(0,1,3,4,5),(0,2,5,7),(1,2,5,6,8),(2,3,4,7,8),(1,4,9),(3,5,10),(4,5,9,10),(6,8,10),(7,8,9))),
+    "f41212": (("GK","RB","RCB","LCB","LB","CDM","RM","LM","CAM","RS","LS"), ((2,3),(2,6),(0,1,3,5),(0,2,4,5),(3,7),(2,3,6,7,8),(1,5,8,9),(4,5,8,10),(5,6,7,9,10),(6,8,10),(7,8,9))),
+    "f41212a": (("GK","RB","RCB","LCB","LB","CDM","RCM","LCM","CAM","RS","LS"), ((2,3),(2,6),(0,1,3,5),(0,2,4,5),(3,7),(2,3,6,7,8),(1,5,8,9),(4,5,8,10),(5,6,7,9,10),(6,8,10),(7,8,9))),
+    "f4141": (("GK","RB","RCB","LCB","LB","CDM","RM","RCM","LCM","LM","ST"), ((2,3),(2,6),(0,1,3,5,7),(0,2,4,5,8),(3,9),(2,3,7,8),(1,7,10),(2,5,6,8,10),(3,5,7,9,10),(4,8,10),(6,7,8,9))),
+    "f4222": (("GK","RB","RCB","LCB","LB","RDM","LDM","RAM","LAM","RS","LS"), ((2,3),(2,7),(0,1,3,5),(0,2,4,6),(3,8),(2,6,7,9),(3,5,8,10),(1,5,9),(4,6,10),(5,7,10),(6,8,9))),
+    "f4231": (("GK","RB","RCB","LCB","LB","RDM","LDM","RAM","CAM","LAM","ST"), ((2,3),(2,5),(0,1,3,5),(0,2,4,6),(3,6),(1,2,7,8),(3,4,8,10),(5,8,10),(5,6,7,9,10),(6,8,10),(7,8,9))),
+    "f4231a": (("GK","RB","RCB","LCB","LB","RDM","LDM","RM","LM","CAM","ST"), ((2,3),(2,5,7),(0,1,3,5),(0,2,4,6),(3,6,8),(1,2,7,9),(3,4,8,9),(1,5,9,10),(4,6,9,10),(5,6,7,8,10),(7,8,9))),
+    "f4312": (("GK","RB","RCB","LCB","LB","RCM","CM","LCM","CAM","RS","LS"), ((2,3),(2,5),(0,1,3,5,6),(0,2,4,6,7),(3,7),(1,2,6,9),(2,3,5,7,8),(3,4,6,10),(6,9,10),(5,8,10),(7,8,9))),
+    "f4321": (("GK","RB","RCB","LCB","LB","RCM","CM","LCM","RF","LF","ST"), ((2,3),(2,5),(0,1,3,5),(0,2,4,7),(3,7),(1,2,6,8),(5,7,8,9),(3,4,6,9),(5,6,10),(6,7,10),(8,9))),
+    "f433": (("GK","RB","RCB","LCB","LB","RCM","CM","LCM","RW","ST","LW"), ((2,3),(2,5),(0,1,3,6),(0,2,4,6),(3,7),(1,6,8),(2,3,5,7,9),(4,6,10),(5,9),(6,8,10),(7,9))),
+    "f433a": (("GK","RB","RCB","LCB","LB","CDM","RCM","LCM","RW","ST","LW"), ((2,3),(2,6),(0,1,3,5),(0,2,4,5),(3,7),(2,3,6,7),(1,5,7,8,9),(4,5,6,9,10),(6,9),(6,7,8,10),(7,9))),
+    "f433b": (("GK","RB","RCB","LCB","LB","RDM","LDM","CM","RW","ST","LW"), ((2,3),(2,5),(0,1,3,5),(0,2,4,6),(3,6),(1,2,7,8),(3,4,7,10),(5,6,9),(5,9),(7,8,10),(6,9))),
+    "f433c": (("GK","RB","RCB","LCB","LB","RCM","LCM","CAM","RW","ST","LW"), ((2,3),(2,5,8),(0,1,3,5),(0,2,4,6),(3,6,10),(1,2,7,8),(3,4,7,10),(5,6,9),(1,5,9),(7,8,10),(4,6,9))),
+    "f433d": (("GK","RB","RCB","LCB","LB","CDM","RCM","LCM","CF","RW","LW"), ((2,3),(2,6,9),(0,1,3,5),(0,2,4,5),(3,7,10),(2,3,6,7),(1,5,8,9),(4,5,8,10),(6,7,9,10),(1,6,8),(4,7,8))),
+    "f4411": (("GK","RB","RCB","LCB","LB","RM","RCM","LCM","LM","CF","ST"), ((2,3),(2,5),(0,1,3,6),(0,2,4,7),(3,8),(1,6,10),(2,5,7,9),(3,6,8,9),(4,7,10),(6,7,10),(5,8,9))),
+    "f442": (("GK","RB","RCB","LCB","LB","RM","RCM","LCM","LM","RS","LS"), ((2,3),(2,5),(0,1,3,6),(0,2,4,7),(3,8),(1,6,9),(2,5,7,9),(3,6,8,10),(4,7,10),(5,6,10),(7,8,9))),
+    "f442a": (("GK","RB","RCB","LCB","LB","RDM","LDM","RM","LM","RS","LS"), ((2,3),(2,7),(0,1,3,5),(0,2,4,6),(3,8),(2,6,7,9),(3,5,8,10),(1,5,9),(4,6,10),(5,7,10),(6,8,9))),
+    "f451": (("GK","RB","RCB","LCB","LB","RM","RCM","CM","LCM","LM","ST"), ((2,3),(2,5,6),(0,1,3,6,7),(0,2,4,7,8),(3,8,9),(1,6,10),(1,2,5,7),(2,3,6,8,10),(3,4,7,9),(4,8,10),(5,7,9))),
+    "f451a": (("GK","RB","RCB","LCB","LB","RM","CM","LM","RAM","LAM","ST"), ((2,3),(2,5),(0,1,3,6),(0,2,4,6),(3,7),(1,8),(2,3,8,9),(4,9),(5,6,9,10),(6,7,8,10),(8,9))),
+    "f5212": (("GK","RWB","RCB","CB","LCB","LWB","RCM","LCM","CAM","RS","LS"), ((2,3,4),(2,6),(0,1,3),(0,2,4,6,7),(0,3,5),(4,7),(1,3,7,8,9),(3,5,6,8,10),(6,7,9,10),(6,8,10),(7,8,9))),
+    "f5221": (("GK","RWB","RCB","CB","LCB","LWB","RCM","LCM","RW","ST","LW"), ((2,3,4),(2,6,8),(0,1,3),(0,2,4,6,7),(0,3,5),(4,7,10),(1,3,7,8,9),(3,5,6,9,10),(1,6,9),(6,7,8,10),(5,7,9))),
+    "f532": (("GK","RWB","RCB","CB","LCB","LWB","RCM","CM","LCM","RS","LS"), ((2,3,4),(2,6),(0,1,3,6),(0,2,4,7),(0,3,5,8),(4,8),(1,2,7,9),(3,6,8,9,10),(4,5,7,10),(6,7,10),(7,8,9))),
+    "f541": (("GK","RWB","RCB","CB","LCB","LWB","CDM","RM","LM","CAM","ST"), ((2,3,4),(2,7),(0,1,3,6),(0,2,4,6),(0,3,5,6),(4,8),(2,3,4,7,8,9),(1,6,9,10),(5,6,9,10),(6,7,8,10),(7,8,9))),
+}
+
+
+def _fut15_slot_position(position: Any) -> str:
+    value = str(position or "").upper()
     return {
-        "id": int(src.get("id", src.get("squadId", 0)) or 0),
+        "RCB": "CB", "LCB": "CB", "RDM": "CDM", "LDM": "CDM",
+        "RCM": "CM", "LCM": "CM", "RAM": "CAM", "LAM": "CAM",
+        "RS": "ST", "LS": "ST",
+    }.get(value, value)
+
+
+def _fut15_position_score(preferred: Any, slot_position: Any) -> int:
+    preferred_value = _fut15_slot_position(preferred)
+    slot_value = _fut15_slot_position(slot_position)
+    if preferred_value == slot_value:
+        return 3
+    related, weak = _FUT15_POSITION_COMPATIBILITY.get(preferred_value, ((), ()))
+    if slot_value in related:
+        return 2
+    if slot_value in weak:
+        return 1
+    return 0
+
+
+def _fut15_identity(
+    item: dict[str, Any], meta: dict[str, Any], text_key: str, numeric_keys: tuple[str, ...],
+) -> tuple[str, Any] | None:
+    for source in (item, meta):
+        text_value = str(source.get(text_key, "") or "").strip().casefold()
+        if text_value:
+            return (text_key, text_value)
+    for source in (item, meta):
+        for key in numeric_keys:
+            try:
+                numeric_value = int(source.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if numeric_value > 0:
+                return (numeric_keys[0], numeric_value)
+    return None
+
+
+def _fut15_player_facts(item: dict[str, Any]) -> dict[str, Any]:
+    try:
+        resource_id = int(item.get("resourceId", item.get("assetId", 0)) or 0)
+    except (TypeError, ValueError):
+        resource_id = 0
+    meta = player_meta(resource_id)
+    return {
+        "club": _fut15_identity(item, meta, "club", ("teamid", "teamId")),
+        "league": _fut15_identity(item, meta, "league", ("leagueId", "leagueid")),
+        "nation": _fut15_identity(item, meta, "nationality", ("nation", "nationId")),
+        "position": str(item.get("preferredPosition") or meta.get("preferredPosition") or "").upper(),
+    }
+
+
+def _fut15_link_value(left: dict[str, Any], right: dict[str, Any]) -> int:
+    same_club = left["club"] is not None and left["club"] == right["club"]
+    same_league = left["league"] is not None and left["league"] == right["league"]
+    same_nation = left["nation"] is not None and left["nation"] == right["nation"]
+    if same_club and same_nation:
+        return 3
+    if same_club or (same_league and same_nation):
+        return 2
+    if same_league or same_nation:
+        return 1
+    return 0
+
+
+def _fut15_position_and_links_chemistry(position_score: int, link_average: float) -> int:
+    # FUT 15 PLC lookup table. Position scores are: wrong, weak, related, natural.
+    if link_average >= 1.6:
+        return (2, 5, 9, 10)[position_score]
+    if link_average >= 1.0:
+        return (2, 5, 8, 9)[position_score]
+    if link_average >= 0.3:
+        return (1, 3, 6, 7)[position_score]
+    return (0, 1, 3, 4)[position_score]
+
+
+def _squad_summary_values(
+    src: dict[str, Any], item_by_id: dict[int, dict[str, Any]] | None = None,
+) -> tuple[int, int]:
+    """Return the client-calculated squad summary, deriving it only as a fallback."""
+    try:
+        saved_rating = int(src.get("rating", src.get("starRating")))
+    except (TypeError, ValueError):
+        saved_rating = -1
+    try:
+        saved_chemistry = int(src.get("chemistry"))
+    except (TypeError, ValueError):
+        saved_chemistry = -1
+    if 0 <= saved_rating <= 99 and 0 <= saved_chemistry <= 100:
+        return saved_rating, saved_chemistry
+
+    if item_by_id is None:
+        item_by_id = {
+            int(x.get("id", 0) or 0): x
+            for x in STATE.list_items()
+            if int(x.get("id", 0) or 0) > 0
+        }
+
+    starters: dict[int, dict[str, Any]] = {}
+    for fallback_index, slot in enumerate(src.get("players", []) if isinstance(src.get("players"), list) else []):
+        if not isinstance(slot, dict):
+            continue
+        try:
+            index = int(slot.get("index", fallback_index) or 0)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= index < 11:
+            continue
+        embedded = slot.get("itemData") if isinstance(slot.get("itemData"), dict) else None
+        item_id = slot.get("itemId")
+        if item_id is None and embedded is not None:
+            item_id = embedded.get("id")
+        try:
+            resolved = item_by_id.get(int(item_id or 0))
+        except (TypeError, ValueError):
+            resolved = None
+        item = resolved or embedded
+        if isinstance(item, dict) and int(item.get("rating", 0) or 0) > 0:
+            starters[index] = item
+
+    ratings = [int(item.get("rating", 0) or 0) for item in starters.values()]
+    if ratings:
+        average = sum(ratings) / len(ratings)
+        correction = sum(max(0.0, value - average) for value in ratings)
+        rating = int(round(sum(ratings) + correction) / len(ratings))
+    else:
+        rating = 0
+    rating = max(0, min(99, rating))
+
+    formation = str(src.get("formation") or "f442").lower()
+    slot_positions, formation_links = _FUT15_FORMATIONS.get(formation, _FUT15_FORMATIONS["f442"])
+    facts = {index: _fut15_player_facts(item) for index, item in starters.items()}
+
+    manager_item: dict[str, Any] | None = None
+    managers = src.get("manager", [])
+    if isinstance(managers, dict):
+        managers = [managers]
+    if isinstance(managers, list):
+        for manager in managers:
+            if not isinstance(manager, dict):
+                continue
+            embedded_manager = manager.get("itemData") if isinstance(manager.get("itemData"), dict) else None
+            try:
+                manager_id = int(manager.get("id", manager.get("itemId", 0)) or 0)
+            except (TypeError, ValueError):
+                manager_id = 0
+            manager_item = item_by_id.get(manager_id) or embedded_manager
+            if manager_item:
+                break
+    manager_facts = _fut15_player_facts(manager_item) if manager_item else None
+
+    chemistry = 0
+    for index, item in starters.items():
+        linked_indices = formation_links[index]
+        linked_facts = [facts[linked] for linked in linked_indices if linked in facts]
+        link_average = (
+            sum(_fut15_link_value(facts[index], teammate) for teammate in linked_facts) / len(linked_facts)
+            if linked_facts else 0.0
+        )
+        position_score = _fut15_position_score(facts[index]["position"], slot_positions[index])
+        individual = _fut15_position_and_links_chemistry(position_score, link_average)
+        if int(item.get("loyaltyBonus", 0) or 0) > 0 or int(item.get("gamesPlayed", 0) or 0) >= 10:
+            individual += 1
+        if manager_facts and (
+            (facts[index]["league"] is not None and facts[index]["league"] == manager_facts["league"])
+            or (facts[index]["nation"] is not None and facts[index]["nation"] == manager_facts["nation"])
+        ):
+            individual += 1
+        chemistry += min(10, individual)
+
+    return rating, max(0, min(100, chemistry))
+
+
+def _compact_squad_record(
+    src: dict[str, Any], item_by_id: dict[int, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    sid = int(src.get("id", src.get("squadId", 0)) or 0)
+    name = str(src.get("squadName") or src.get("name") or "Local XI")
+    rating, chemistry = _squad_summary_values(src, item_by_id)
+    return {
+        "id": sid,
+        "squadId": sid,
         "personaId": int(CFG.get("persona_id", 1)),
-        "squadName": str(src.get("squadName") or src.get("name") or "Local XI"),
+        "squadName": name,
+        "name": name,
         "formation": str(src.get("formation") or "f442"),
         "active": bool(src.get("active", False)),
         "changed": bool(src.get("changed", False)),
-        "chemistry": int(src.get("chemistry", 0) or 0),
-        "starRating": int(src.get("starRating", src.get("rating", 0)) or 0),
-        "rating": int(src.get("rating", src.get("starRating", 0)) or 0),
+        "chemistry": chemistry,
+        "starRating": rating,
+        "rating": rating,
         "valid": bool(src.get("valid", True)),
         "newsquad": int(src.get("newsquad", 0) or 0),
     }
 
 def _native_squad_list() -> dict[str, Any]:
     squads = STATE.list_squads()
-    compact = [_compact_squad_record(x) for x in squads]
+    item_by_id = {
+        int(x.get("id", 0) or 0): x
+        for x in STATE.list_items()
+        if int(x.get("id", 0) or 0) > 0
+    }
+    compact = [_compact_squad_record(x, item_by_id) for x in squads]
     active = next((x for x in compact if x.get("active")), compact[0] if compact else None)
     return {
         "activeSquadId": int(active.get("id", 0) if active else 0),
         "squad": compact,
+        # The PC client uses the singular key in some builds, while the web
+        # app serializer uses the plural form. Returning both keeps list/create
+        # flows compatible without changing the established response shape.
+        "squads": compact,
     }
 
 
@@ -5009,8 +5378,30 @@ def route_fut(method: str, raw_path: str, headers: dict[str, str], body: bytes) 
     if low == "/ut/game/fifa15/loan/players":
         return 200, {}, json_bytes({"loans": []})
 
-    if low == "/ut/game/fifa15/squad/active" and method == "GET":
-        return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad())
+    # The FIFA 15 PC client tunnels squad deletion through a GET on the
+    # dedicated /ut/delete prefix instead of issuing DELETE /squad/{id}.
+    tunneled_squad_delete = re.match(r"^/ut/delete/game/fifa15/squad/(\d+)$", low)
+    if tunneled_squad_delete and method in ("GET", "POST", "DELETE"):
+        sid = int(tunneled_squad_delete.group(1))
+        ok = STATE.delete_squad(sid)
+        log.warning("SQUAD DELETE TUNNEL sid=%s success=%s", sid, ok)
+        return 200, {"Cache-Control": "no-store"}, json_bytes({})
+
+    if low == "/ut/game/fifa15/squad/active":
+        if method == "GET":
+            return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad())
+        if method in ("POST", "PUT", "PATCH"):
+            doc = _squad_request_document(payload)
+            sid = _squad_request_id(
+                doc, query, "activeSquadId", "activeSquad", "squadId", "id",
+            )
+            if sid is None:
+                return 400, {"Cache-Control": "no-store"}, json_bytes({"error": "squad id required"})
+            active = STATE.activate_squad(sid)
+            if not active:
+                return 404, {"Cache-Control": "no-store"}, json_bytes({"error": "squad not found"})
+            log.warning("SQUAD ACTIVE sid=%s", sid)
+            return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad(sid))
 
     if low == "/ut/game/fifa15/squad/list" and method == "GET":
         response = _native_squad_list()
@@ -5020,33 +5411,182 @@ def route_fut(method: str, raw_path: str, headers: dict[str, str], body: bytes) 
     if low == "/ut/game/fifa15/squad" and method == "GET":
         return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad_list())
 
-    if low == "/ut/game/fifa15/squad" and method == "POST":
-        created = STATE.create_squad(payload if isinstance(payload, dict) else {})
-        return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad(int(created.get("id", 0) or 0)))
+    if low == "/ut/game/fifa15/squad" and method in ("POST", "PUT", "PATCH"):
+        doc = _squad_request_document(payload)
+        action = str(doc.get("action") or doc.get("operation") or "").strip().casefold()
+        requested_id = _squad_request_id(doc, query, "squadId", "id")
+        requested_name = _squad_request_value(
+            doc, query, "dstSquadName", "newSquadName", "newName", "squadName", "name",
+        )
+        player_references = _squad_player_reference_count(doc)
+        existing_squads = {
+            int(x.get("id", x.get("squadId", 0)) or 0): x
+            for x in STATE.list_squads()
+        }
+        existing_ids = set(existing_squads)
+        update_actions = {"rename", "rename_squad", "save", "update"}
+        source_squad = existing_squads.get(int(requested_id or 0))
+        source_name = str(
+            (source_squad or {}).get("squadName") or (source_squad or {}).get("name") or ""
+        ).strip()
+        # Copy Squad posts the complete source XI to the collection endpoint.
+        # Its destination name is arbitrary, so it cannot be identified only
+        # by localized labels such as "COPIE ...". Native renames use the
+        # lightweight PUT /squad/{id} route observed above.
+        full_squad_copy = (
+            method == "POST"
+            and action not in update_actions
+            and requested_id in existing_ids
+            and player_references > 0
+            and bool(str(requested_name or "").strip())
+            and str(requested_name).strip().casefold() != source_name.casefold()
+        )
+        copy_request = (
+            method == "POST"
+            and action not in update_actions
+            and (
+                action in {"clone", "copy", "duplicate", "duplicate_squad"}
+                or _squad_copy_name(requested_name)
+                or full_squad_copy
+            )
+        )
 
-    if low == "/ut/game/fifa15/squad/clone" and method == "POST":
-        src = dict(payload) if isinstance(payload, dict) else {}
-        source_id = int(src.get("srcId", src.get("id", 0)) or 0)
-        name = str(src.get("dstSquadName", src.get("squadName", "")) or "")
+        log.warning(
+            "SQUAD HTTP ROOT REQUEST method=%s id=%r squadId=%r action=%s name=%r playerRefs=%s keys=%s",
+            method, doc.get("id"), doc.get("squadId"), action, requested_name, player_references, sorted(doc.keys()),
+        )
+
+        # FIFA 15 sends the complete source squad when the user chooses Copy,
+        # but its ``id`` is not reliably the selected squad id. It can be a
+        # stale UI/model id, including an id of a squad already deleted. The
+        # submitted 23 slots are therefore authoritative.
+        if copy_request:
+            source_id = _squad_request_id(
+                doc, query, "srcId", "sourceId", "sourceSquadId", "srcSquadId", "fromSquadId", "squadId", "id",
+            )
+            if player_references > 0:
+                copied_doc = dict(doc)
+                copied_doc.pop("id", None)
+                copied_doc.pop("squadId", None)
+                copied_doc["squadName"] = str(requested_name or "").strip() or "New Squad"
+                copied_doc["name"] = copied_doc["squadName"]
+                copied = STATE.create_squad(copied_doc)
+                sid = int(copied.get("id", 0) or 0)
+                log.warning(
+                    "SQUAD HTTP ROOT COPY payloadSource=%s sid=%s name=%s players=%s",
+                    source_id, sid, copied.get("squadName"), player_references,
+                )
+                return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad(sid))
+
+            if source_id is None:
+                source_id = int(_native_squad().get("id", 1) or 1)
+            cloned = STATE.clone_squad(source_id, str(requested_name or "").strip() or None)
+            if not cloned:
+                return 404, {"Cache-Control": "no-store"}, json_bytes({"error": "squad not found"})
+            sid = int(cloned.get("id", 0) or 0)
+            log.warning("SQUAD HTTP ROOT COPY source=%s sid=%s name=%s", source_id, sid, cloned.get("squadName"))
+            return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad(sid))
+
+        # A same-name full POST is a defensive collection-level save. A POST
+        # with a different name has already been handled as Copy above.
+        root_post_save = (
+            method == "POST"
+            and requested_id is not None
+            and requested_id in existing_ids
+            and player_references > 0
+        )
+        is_update = (
+            method in ("PUT", "PATCH")
+            or action in update_actions
+            or root_post_save
+        )
+        if is_update:
+            if requested_id is None:
+                requested_id = int(_native_squad().get("id", 1) or 1)
+            doc["id"] = requested_id
+            doc["squadId"] = requested_id
+            saved = STATE.save_squad(doc)
+            log.warning(
+                "SQUAD HTTP ROOT SAVE sid=%s collectionSave=%s keys=%s name=%s",
+                requested_id, root_post_save, sorted(doc.keys()), saved.get("squadName"),
+            )
+            return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad(requested_id))
+
+        created = STATE.create_squad(doc)
+        sid = int(created.get("id", 0) or 0)
+        log.warning("SQUAD HTTP CREATE sid=%s name=%s", sid, created.get("squadName"))
+        return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad(sid))
+
+    if low == "/ut/game/fifa15/squad/clone" and method in ("POST", "PUT", "PATCH"):
+        src = _squad_request_document(payload)
+        source_id = _squad_request_id(
+            src, query, "srcId", "sourceId", "sourceSquadId", "srcSquadId", "fromSquadId", "id", "squadId",
+        )
+        if source_id is None:
+            source_id = int(_native_squad().get("id", 1) or 1)
+        raw_name = _squad_request_value(
+            src, query, "dstSquadName", "newSquadName", "newName", "squadName", "name",
+        )
+        name = str(raw_name or "").strip() or None
         cloned = STATE.clone_squad(source_id, name)
         if not cloned:
             return 404, {"Cache-Control": "no-store"}, json_bytes({"error": "squad not found"})
-        return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad(int(cloned.get("id", 0) or 0)))
+        sid = int(cloned.get("id", 0) or 0)
+        log.warning("SQUAD HTTP CLONE source=%s sid=%s name=%s", source_id, sid, cloned.get("squadName"))
+        return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad(sid))
 
     squad_id_match = re.match(r"^/ut/game/fifa15/squad/(\d+)$", low)
     if squad_id_match:
         sid = int(squad_id_match.group(1))
         if method == "GET":
+            if not any(int(x.get("id", x.get("squadId", 0)) or 0) == sid for x in STATE.list_squads()):
+                return 404, {"Cache-Control": "no-store"}, json_bytes({"error": "squad not found"})
+            # Accept a body-bearing GET as a defensive compatibility path for
+            # clients/proxies that tunnel a metadata-only squad save.
+            get_doc = _squad_request_document(payload)
+            get_name = _squad_request_value(get_doc, query, "squadName", "name", "newSquadName", "newName")
+            if body and get_name:
+                get_doc["id"] = sid
+                get_doc["squadId"] = sid
+                saved = STATE.save_squad(get_doc)
+                log.warning("SQUAD HTTP GET RENAME sid=%s name=%s", sid, saved.get("squadName"))
             return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad(sid))
         if method == "DELETE":
             ok = STATE.delete_squad(sid)
             log.warning("SQUAD DELETE sid=%s success=%s", sid, ok)
-            return 200, {"Cache-Control": "no-store"}, b""
-        if method in ("PUT", "POST"):
-            src = dict(payload) if isinstance(payload, dict) else {}
+            return 200, {"Cache-Control": "no-store"}, json_bytes({
+                "success": bool(ok), "squadId": sid, "squadList": _native_squad_list(),
+            })
+        if method in ("PUT", "POST", "PATCH"):
+            src = _squad_request_document(payload)
+            # UpdateSquadName uses its own response type in the native PC
+            # client. It sends only the new name to /squad/{id} and expects an
+            # empty success document; returning the full squad can make the
+            # client reject or roll back its local rename.
+            rename_fields = {
+                "id", "squadId", "squadName", "name", "newSquadName", "newName",
+            }
+            rename_only = (
+                bool(_squad_request_value(
+                    src, query, "squadName", "name", "newSquadName", "newName",
+                ))
+                and not set(src).difference(rename_fields)
+            )
+            if _squad_bool(_squad_request_value(src, query, "active", "setActive"), False):
+                activated = STATE.activate_squad(sid)
+                if not activated:
+                    return 404, {"Cache-Control": "no-store"}, json_bytes({"error": "squad not found"})
             src["id"] = sid
+            src["squadId"] = sid
             saved = STATE.save_squad(src)
-            log.warning("SQUAD HTTP SAVE sid=%s keys=%s playersInRequest=%s", sid, sorted(src.keys()), len(src.get("players", [])) if isinstance(src.get("players"), list) else None)
+            log.warning(
+                "SQUAD HTTP SAVE sid=%s keys=%s playersInRequest=%s name=%s",
+                sid, sorted(src.keys()), len(src.get("players", [])) if isinstance(src.get("players"), list) else None,
+                saved.get("squadName"),
+            )
+            if rename_only:
+                log.warning("SQUAD HTTP RENAME RESPONSE sid=%s empty=True", sid)
+                return 200, {"Cache-Control": "no-store"}, json_bytes({})
             return 200, {"Cache-Control": "no-store"}, json_bytes(_native_squad(int(saved.get("id", sid) or sid)))
 
     if low == "/ut/game/fifa15/eventfeed":
